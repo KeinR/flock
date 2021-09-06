@@ -1,0 +1,149 @@
+#!/usr/bin/bash
+
+FLOCK_USER=flock-guard
+BASE_DIR="/home/$FLOCK_USER"
+
+function die() {
+    echo "ERROR: $1"
+    echo "Aborting..."
+    exit 1
+}
+
+function read_password() {
+    read -s result
+    result=($(echo "$result"))
+    echo -n "${result[0]}"
+}
+
+function flock_create() {
+    [[ $UID != 0 ]] && die "must be run as root!"
+    [[ $# != 2 ]] && die "requires two arguments: directory and group"
+    dir="$1"
+    group="$2"
+    dir="$(echo "$dir" | sed 's/\/$//g')"
+    [[ -n "$(echo -n "$dir" | grep /)" ]] && die "directory name cannot contain slashes"
+    dir="$BASE_DIR/$dir"
+    lock="${dir}.lock"
+    
+    [[ -e "$dir" ]] && die "folder exists!"
+    [[ -e "$lock" ]] && die "lock file exists!"
+    
+    if [[ -z "$(compgen -u | grep "$FLOCK_USER")" ]]; then
+        echo "Creating user $FLOCK_USER as it does not exist"
+        useradd "$FLOCK_USER"
+        # Will be word read/writable, so needs sticky
+    fi
+    if [[ -e "$BASE_DIR" ]]; then
+        [[ ! (-d "$BASE_DIR") ]] && die "bad basedir, is it a file???"
+    else
+        mkdir "$BASE_DIR"
+    fi
+    # Just in case
+    chmod 1777 "$BASE_DIR"
+
+    mkdir "$dir"
+    [[ $? != 0 ]] && echo "invalid directory name"
+
+    echo -n "Folder password:"
+    password="$(read_password)"
+    echo
+
+    chown $FLOCK_USER:$group "$dir"
+    chmod 000 "$dir"
+    
+    touch "$lock"
+    chmod 200 "$lock"
+
+    lockin="$(mktemp)"
+    lockout="$(mktemp)"
+
+    cat <<EOF > "$lockin"
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+
+#include <termios.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define HOME_DIR "$(readlink --canonicalize "$dir")"
+#define PASSWORD "$password"
+#define PASS_BUF_SIZE 128
+
+int readNoEcho(char *buffer, size_t bufLen) {
+    // Adapted from The Linux Programming Interface
+
+    struct termios tp, save;
+
+    if (tcgetattr(STDIN_FILENO, &tp) == -1)
+        return 1;
+    save = tp;
+    tp.c_lflag &= ~ECHO;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &tp) == -1)
+        return 1;
+
+    fflush(stdout);
+    if (fgets(buffer, bufLen, stdin) == NULL)
+        return 1;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &save) == -1)
+        return 1;
+
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    
+    if (argc != 2) {
+        puts("open or close");
+        return 1;
+    }
+
+    const char *action = argv[1];
+
+    if (strcmp(action, "open") == 0) {
+        printf("Password:");
+        fflush(stdout);
+        char buffer[PASS_BUF_SIZE];
+        int fail = readNoEcho(buffer, PASS_BUF_SIZE);
+        int il = strlen(buffer);
+        printf("\n");
+
+        // Remote trailing newline
+        if (il - 1 > 0 && buffer[il - 1] == '\n')
+            buffer[il - 1] = 0;
+
+        if (fail || strcmp(PASSWORD, buffer) != 0) {
+            puts("Incorrect");
+            return 1;
+        }
+        chmod(HOME_DIR, 0070);
+        puts("Folder unlocked");
+    } else if (strcmp(action, "close") == 0) {
+        chmod(HOME_DIR, 0000);
+        puts("Folder locked");
+    } else {
+        puts("open or close");
+        return 1;
+    }
+
+    return 0;
+}
+EOF
+    chmod 600 "$lockin"
+    chmod 600 "$lockout"
+    chown $FLOCK_USER:$group "$lockin"
+    chown $FLOCK_USER:$group "$lockout"
+    
+    # Yah not compiling shit as root
+    su $FLOCK_USER -c "/usr/bin/gcc -x c \"$lockin\" -o \"$lockout\""
+    rm "$lockin"
+    cat "$lockout" > "$lock"
+    rm "$lockout"
+    chown $FLOCK_USER:$group "$lock"
+    chmod 4110 "$lock"
+    echo "Done."
+}
+
+flock_create "$@"
+
